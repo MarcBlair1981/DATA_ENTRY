@@ -1,0 +1,20 @@
+# Python
+__pycache__/
+*.pyc
+
+# User Data / Uploads
+manual_entry_app/uploads/
+*.csv
+
+# Logs & Temporary Files
+*.log
+modal_debug.html
+modal_debug.png
+modal_fragment.html
+table_dump.html
+browser_test/
+
+# System / IDE
+.DS_Store
+.vscode/
+.idea/
