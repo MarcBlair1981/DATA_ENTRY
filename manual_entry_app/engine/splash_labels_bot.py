@@ -196,6 +196,10 @@ class SplashLabelBot:
                             target_cell = page.locator('.ag-cell[col-id="en"]').filter(has_text=search_val).first
                             if not target_cell.is_visible():
                                 target_cell = page.locator('.ag-cell[col-id="en"]').get_by_text(search_val, exact=True).first
+                            
+                            if not target_cell.is_visible():
+                                # Fallback: Look in any cell (critical for Questions mode where col-id is usually 'text')
+                                target_cell = page.locator('.ag-cell').filter(has_text=search_val).first
                         
                         if not target_cell or not target_cell.is_visible():
                             self.log(f"[SKIP] Row not visible for: {search_val}", "WARNING")
@@ -290,7 +294,7 @@ class SplashLabelBot:
                             if mode == 'verify':
                                 self._verify_entry(page, config['drawer_label'], target_val, csv_col)
                             else:
-                                self._update_entry(page, config, target_val, csv_col)
+                                self._update_entry(page, config, target_val, csv_col, skip_save=True)
                     
                     # --- FINAL SAVE STEP ---
                     # We MUST save the "Update Label" modal if we made changes.
@@ -301,23 +305,52 @@ class SplashLabelBot:
                         
                         # --- 1. SAVE LABEL EDITOR (Topmost Dialog) ---
                         # We specifically target the LAST open dialog, which is the Label Editor.
-                        top_dialog = page.locator('.mat-mdc-dialog-container').last
-                        label_save = top_dialog.locator('button', has_text='Save').first
-                        
-                        if label_save.is_visible() and label_save.is_enabled():
-                            label_save.click()
-                            # Critical: Wait for this specific dialog to close to confirm save
-                            # This prevents us from interacting with the underlying dialog too early
-                            try:
-                                top_dialog.wait_for(state='hidden', timeout=3000)
-                            except:
-                                self.log("  [WARN] Label dialog didn't close immediately. Pressing Escape...", "WARNING")
+                        page.wait_for_timeout(1000)
+
+                        label_dialog = page.locator('.mat-mdc-dialog-container').filter(has_text=re.compile(r'Update Label', re.I)).last
+                        if not label_dialog.is_visible():
+                            label_dialog = page.locator('.mat-mdc-dialog-container').last
+
+                        # FORCE DIRTY STATE: Use the LAST visible input to trigger validation
+                        try:
+                            last_input = label_dialog.locator('input, textarea').last
+                            if last_input.is_visible():
+                                last_input.click()
+                                page.keyboard.type(" ") 
+                                page.keyboard.press("Backspace") 
+                                page.keyboard.press("Tab")
+                                page.wait_for_timeout(500)
+                        except:
+                            pass
+
+                        label_save = label_dialog.locator('button:has-text("Save")').first
+
+                        if label_save.is_visible():
+                            if not label_save.is_enabled():
+                                 self.log("  [WARN] Save button is disabled. Trying to click dialog background to force blur...", "WARNING")
+                                 label_dialog.locator('.mat-mdc-dialog-surface').click(position={'x': 10, 'y': 10})
+                                 page.wait_for_timeout(500)
+
+                            if label_save.is_enabled():
+                                self.log("  [Step] Clicking Label Save...", "INFO")
+                                label_save.click(force=True)
+                                try:
+                                    label_dialog.wait_for(state='hidden', timeout=7000)
+                                except:
+                                    self.log("  [WARN] Label dialog didn't close immediately. Pressing Escape...", "WARNING")
+                                    page.keyboard.press("Escape")
+                            else:
+                                self.log("  [WARN] Save button persistent disabled. Closing.", "WARNING")
                                 page.keyboard.press("Escape")
                         else:
-                            self.log("  [WARN] Could not find/click Save on Label modal. Trying Escape...", "WARNING")
-                            page.keyboard.press("Escape")
+                            self.log("  [WARN] Could not find/click Save on Label modal. Trying broad search...", "WARNING")
+                            broad_save = page.locator('button:has-text("Save")').last
+                            if broad_save.is_visible() and broad_save.is_enabled():
+                                broad_save.click(force=True)
+                            else:
+                                page.keyboard.press("Escape")
                         
-                        page.wait_for_timeout(500) # Settle time
+                        page.wait_for_timeout(1500) # Settle time
 
                         page.wait_for_timeout(500) # Settle time
 
@@ -335,9 +368,26 @@ class SplashLabelBot:
                             header = question_dialog.locator('h1, h2, h3').filter(has_text='Question Template').first
                             
                             if header.is_visible():
-                                question_save = question_dialog.locator('button', has_text='Save').first
+                                # FORCE DIRTY STATE on parent:
+                                try:
+                                    last_input = question_dialog.locator('input, textarea').last
+                                    if last_input.is_visible():
+                                        last_input.click()
+                                        page.keyboard.type(" ") 
+                                        page.keyboard.press("Backspace") 
+                                        page.keyboard.press("Tab")
+                                        page.wait_for_timeout(500)
+                                except:
+                                    pass
+
+                                question_save = question_dialog.locator('button:has-text("Save")').first
+                                if question_save.is_visible() and not question_save.is_enabled():
+                                    question_dialog.locator('.mat-mdc-dialog-surface').click(position={'x': 10, 'y': 10})
+                                    page.wait_for_timeout(500)
+
                                 if question_save.is_visible() and question_save.is_enabled():
-                                    question_save.click()
+                                    self.log("  [Step] Clicking Question Template Save...", "INFO")
+                                    question_save.click(force=True)
                                     try:
                                         question_dialog.wait_for(state='hidden', timeout=3000)
                                         if is_new_question:
