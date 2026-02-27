@@ -1,5 +1,6 @@
 import csv
 import time
+import re
 from playwright.sync_api import sync_playwright
 
 class SplashLabelBot:
@@ -13,7 +14,7 @@ class SplashLabelBot:
         """
         mode: 'import' or 'verify'
         backfill_en: True/False
-        workflow_mode: 'labels' or 'questions'
+        workflow_mode: 'labels', 'questions', or 'participants'
         """
         # Load CSV
         rows = self._load_csv(csv_file_path)
@@ -38,7 +39,10 @@ class SplashLabelBot:
             self.log("Waiting for user to Log In...", "WARNING")
             self.log("STEP 1: Log In.", "INFO")
             self.log("STEP 2: Select the CLIENT you want to update.", "INFO")
-            self.log("STEP 3: Navigate to the 'Labels' page.", "INFO")
+            if workflow_mode == 'participants':
+                self.log("STEP 3: Navigate to the 'Participants (Competitors)' page.", "INFO")
+            else:
+                self.log("STEP 3: Navigate to the 'Labels' page.", "INFO")
             self.log("Waiting 45 seconds for you to get ready...", "WARNING")
             
             # Wait for user setup
@@ -90,6 +94,17 @@ class SplashLabelBot:
                 
                 self.log(f"Processing: '{search_val}' (via {search_col})", "INFO")
 
+                # === PARTICIPANTS MODE ===
+                if workflow_mode == 'participants':
+                    try:
+                        self._process_participants(page, row, search_val, mode, backfill_en)
+                    except Exception as e:
+                        self.log(f"Error processing participant '{search_val}': {e}", "ERROR")
+                        page.keyboard.press("Escape")
+                        page.wait_for_timeout(500)
+                        page.keyboard.press("Escape")
+                    continue
+
                 try:
                     # --- CLEANUP / SAFETY ---
                     if page.locator('.mat-mdc-dialog-container').is_visible():
@@ -139,7 +154,6 @@ class SplashLabelBot:
                                 self._close_drawer(page) # Cancel
                                 continue
                                 
-                            # Click Translate - reusing logic from Update flow?
                             # We can just jump to the "Question Mode" branching logic 
                             # But we are not "clicking a row" here.
                             # So we copy the translate click logic here.
@@ -199,7 +213,6 @@ class SplashLabelBot:
                             self.log("  [Question Mode] Looking for Translate button (Edit Mode)...", "INFO")
                             
                             try:
-                                # Use robust data-test locator
                                 translate_btn = page.locator('app-input-label[data-test="question-text"] mat-icon[data-test="language-icon"]').last
                                 
                                 if translate_btn.is_visible():
@@ -236,6 +249,12 @@ class SplashLabelBot:
                         'Dutch': {'code': 'nl', 'search_term': 'dutch', 'drawer_label': 'Dutch (nl)', 'aliases': ['dutch', 'nl']},
                         'Italian': {'code': 'it', 'search_term': 'italian', 'drawer_label': 'Italian (it)', 'aliases': ['italian', 'it']},
                         'Portuguese': {'code': 'pt', 'search_term': 'portuguese', 'drawer_label': 'Portuguese (pt)', 'aliases': ['portuguese', 'pt', 'br']},
+                        'Amharic': {'code': 'am', 'search_term': 'amharic', 'drawer_label': 'Amharic (am)', 'aliases': ['amharic', 'am']},
+                        'Danish': {'code': 'da', 'search_term': 'danish', 'drawer_label': 'Danish (da)', 'aliases': ['danish', 'da']},
+                        'Norwegian': {'code': 'no', 'search_term': 'norweg', 'drawer_label': 'Norwegian (no)', 'aliases': ['norwegian', 'no']},
+                        'Bulgarian': {'code': 'bg', 'search_term': 'bulgari', 'drawer_label': 'Bulgarian (bg)', 'aliases': ['bulgarian', 'bg']},
+                        'Russian': {'code': 'ru', 'search_term': 'russian', 'drawer_label': 'Russian (ru)', 'aliases': ['russian', 'ru']},
+                        'Serbian': {'code': 'sr', 'search_term': 'serbian', 'drawer_label': 'Serbian (sr)', 'aliases': ['serbian', 'sr']},
                     }
 
                     # Conditionally add English
@@ -398,7 +417,7 @@ class SplashLabelBot:
         self.log("Failed to read CSV with any encoding.", "ERROR")
         return []
 
-    def _update_entry(self, page, config, target_val, lang_name):
+    def _update_entry(self, page, config, target_val, lang_name, skip_save=False):
         # 1. Check if language row exists in Drawer
         # Robust check: Look for the text inside the dialog using multiple potential containers
         # The text 'Dutch (nl)' usually appears in a mat-select or mat-form-field
@@ -427,39 +446,92 @@ class SplashLabelBot:
                   lang_row = candidate
         
         if lang_row and lang_row.is_visible():
-            # UPDATE EXISTING
-            self.log(f"  [{lang_name}] Updating existing entry...", "INFO")
-            # Refined Strategy:
-            # The previous bot logic for "Update" (if row exists) was:
-            # locate language label -> find sibling input?
-            # Actually, previous bot mostly relied on "Add" if missing.
-            # Let's try to find an input near the label.
-            
-            # Using the "Edit" button if present? usually inputs are just there.
-            # Let's try locating the textarea/input in the same container.
-            
-            input_locator = lang_row.locator('xpath=..').locator('textarea, input').first
-            if not input_locator.is_visible():
-                 # Fallback: traverse up and find 'mat-form-field'
-                 input_locator = lang_row.locator('xpath=../..').locator('textarea, input').first
-            
-            if input_locator.is_visible():
+            input_locator = None
+
+            # Strategy 1: Go up to mat-form-field ancestor (most specific/reliable)
+            try:
+                mff = lang_row.locator('xpath=./ancestor::mat-form-field[1]')
+                if mff.count() == 1 and mff.is_visible():
+                    # The value input is the SIBLING mat-form-field, not this one
+                    # So go up one more level and find all inputs there
+                    parent = mff.locator('xpath=..')
+                    inputs = parent.locator('input, textarea').all()
+                    visible_inputs = [i for i in inputs if i.is_visible()]
+                    if visible_inputs:
+                        input_locator = visible_inputs[-1]  # Last input = value field
+            except:
+                pass
+
+            # Strategy 2: Go up to nearest flex/grid div ancestor (separately, no union)
+            if not input_locator or not input_locator.is_visible():
+                try:
+                    flex_ancestor = lang_row.locator('xpath=./ancestor::div[contains(@class,"flex")][1]')
+                    if flex_ancestor.count() == 1 and flex_ancestor.is_visible():
+                        inputs = flex_ancestor.locator('input, textarea').all()
+                        visible_inputs = [i for i in inputs if i.is_visible()]
+                        if visible_inputs:
+                            input_locator = visible_inputs[-1]
+                except:
+                    pass
+
+            # Strategy 3: Page-level filter (scoped to dialog content)
+            if not input_locator or not input_locator.is_visible():
+                try:
+                    dialog_content = page.locator('mat-dialog-content').first
+                    row_container = dialog_content.locator('mat-form-field').filter(has=lang_row).first
+                    if row_container.is_visible():
+                        parent = row_container.locator('xpath=..')
+                        inputs = parent.locator('input, textarea').all()
+                        visible_inputs = [i for i in inputs if i.is_visible()]
+                        if visible_inputs:
+                            input_locator = visible_inputs[-1]
+                except:
+                    pass
+
+            if input_locator and input_locator.is_visible():
+                current_val = input_locator.input_value().strip()
+                
+                # Check if input is disabled or readonly
+                is_editable = page.evaluate("(el) => !el.disabled && !el.readOnly", input_locator.element_handle())
+                
+                if current_val == target_val.strip():
+                    self.log(f"  [{lang_name}] Already correct: '{current_val}'", "SUCCESS")
+                    return
+                
+                if not is_editable:
+                    self.log(f"  [{lang_name}] Field is READONLY/DISABLED. Skipping update.", "WARNING")
+                    return
+
+                # UPDATE EXISTING
+                self.log(f"  [{lang_name}] Updating: '{current_val}' -> '{target_val}'", "INFO")
+                input_locator.click(force=True)
+                page.keyboard.press("Control+A")
+                page.keyboard.press("Backspace")
                 input_locator.fill(target_val)
-                # Auto-save triggers on blur or enter? Usually explicit Save button?
-                # Previous bot pressed Enter.
-                # page.keyboard.press('Enter') # Might submit form?
-                # Usually there is a "Save" button at the bottom of drawer?
-                pass 
+                input_locator.press("Tab")
             else:
-                 self.log(f"  [{lang_name}] Could not find input for existing row.", "ERROR")
-                 return
+                self.log(f"  [{lang_name}] Could not find input for existing row. Trying keyboard fallback...", "WARNING")
+                # Use force=True because the mat-select might be 'disabled' but we still want to grab focus near it
+                try:
+                    lang_row.click(force=True, timeout=2000)
+                    page.keyboard.press("Tab")
+                    page.wait_for_timeout(200)
+                    page.keyboard.type(target_val)
+                    page.keyboard.press("Tab")
+                except:
+                    self.log(f"  [{lang_name}] Fallback failed. Row may be completely non-interactive.", "ERROR")
+
 
         else:
             # ADD NEW
             self.log(f"  [{lang_name}] Adding new entry for {config['drawer_label']}...", "INFO")
             
             # 1. Click 'Add Value'
-            add_btn = page.locator("[data-test=\"add-value\"]").first
+            add_btn = page.locator("[data-test=\"add-value\"], button:has-text(\"Add Value\")").first
+            if not add_btn.is_visible():
+                 # Try finding by icon
+                 add_btn = page.locator("mat-icon:has-text(\"add\")").locator("xpath=..").first
+                 
             if not add_btn.is_visible():
                  self.log(f"  [{lang_name}] 'Add Value' button not found. Cannot add new language.", "ERROR")
                  return
@@ -530,6 +602,11 @@ class SplashLabelBot:
                 # Try to recover by closing drawer?
                 pass
                 
+        # SAVE (Common) - Skip if caller handles saving (e.g. participants mode)
+        if skip_save:
+            self.log(f"  [{lang_name}] Filled: {target_val} (save deferred)", "INFO")
+            return
+
         # SAVE (Common)
         # Find global "Save" button in drawer/dialog
         # Use a more specific locator if possible, or fallback to text.
@@ -596,3 +673,302 @@ class SplashLabelBot:
             self.log(f"  [MATCH] {lang_name}: {current_val}", "SUCCESS")
         else:
             self.log(f"  [MISMATCH] {lang_name}. Expected: '{target_val}', Found: '{current_val}'", "ERROR")
+
+    def _process_participants(self, page, row, search_val, mode, backfill_en):
+        """
+        Process a single participant (country) entry.
+        Handles multiple matching rows (e.g., same country with shirt + flag logos).
+        For each match: Click row -> Competitor dialog -> Translate icon -> Update Label -> Save.
+        """
+        # --- FULL LANGUAGE CONFIG ---
+        lang_config = {
+            'Thai': {'code': 'th', 'search_term': 'thai', 'drawer_label': 'Thai (th)', 'aliases': ['thai', 'th']},
+            'Vietnamese': {'code': 'vi', 'search_term': 'viet', 'drawer_label': 'Vietnamese (vi)', 'aliases': ['vietnamese', 'vi', 'vn']},
+            'Spanish': {'code': 'es', 'search_term': 'spanish', 'drawer_label': 'Spanish (es)', 'aliases': ['spanish', 'es', 'esp']},
+            'German': {'code': 'de', 'search_term': 'german', 'drawer_label': 'German (de)', 'aliases': ['german', 'de']},
+            'Japanese': {'code': 'ja', 'search_term': 'japanese', 'drawer_label': 'Japanese (ja)', 'aliases': ['japanese', 'ja', 'jp']},
+            'French': {'code': 'fr', 'search_term': 'french', 'drawer_label': 'French (fr)', 'aliases': ['french', 'fr']},
+            'Hungarian': {'code': 'hu', 'search_term': 'hungarian', 'drawer_label': 'Hungarian (hu)', 'aliases': ['hungarian', 'hu']},
+            'Dutch': {'code': 'nl', 'search_term': 'dutch', 'drawer_label': 'Dutch (nl)', 'aliases': ['dutch', 'nl']},
+            'Italian': {'code': 'it', 'search_term': 'italian', 'drawer_label': 'Italian (it)', 'aliases': ['italian', 'it']},
+            'Portuguese': {'code': 'pt', 'search_term': 'portuguese', 'drawer_label': 'Portuguese (pt)', 'aliases': ['portuguese', 'pt', 'br']},
+            'Amharic': {'code': 'am', 'search_term': 'amharic', 'drawer_label': 'Amharic (am)', 'aliases': ['amharic', 'am']},
+            'Danish': {'code': 'da', 'search_term': 'danish', 'drawer_label': 'Danish (da)', 'aliases': ['danish', 'da']},
+            'Norwegian': {'code': 'no', 'search_term': 'norweg', 'drawer_label': 'Norwegian (no)', 'aliases': ['norwegian', 'no']},
+            'Bulgarian': {'code': 'bg', 'search_term': 'bulgari', 'drawer_label': 'Bulgarian (bg)', 'aliases': ['bulgarian', 'bg']},
+            'Russian': {'code': 'ru', 'search_term': 'russian', 'drawer_label': 'Russian (ru)', 'aliases': ['russian', 'ru']},
+            'Serbian': {'code': 'sr', 'search_term': 'serbian', 'drawer_label': 'Serbian (sr)', 'aliases': ['serbian', 'sr']},
+        }
+        if backfill_en:
+            lang_config['English'] = {'code': 'en', 'search_term': 'english', 'drawer_label': 'English (en)', 'aliases': ['english', 'en']}
+
+        # Determine which CSV columns match our languages
+        header_map = {k.strip().lower(): k for k in row.keys()}
+        found_langs = []
+        for lang_key, config in lang_config.items():
+            for alias in config['aliases']:
+                if alias in header_map:
+                    found_langs.append((lang_key, header_map[alias]))
+                    break
+
+        if not found_langs:
+            self.log(f"  [WARN] No matching language columns found in CSV.", "WARNING")
+            return
+
+        # --- CLEANUP: Close any open dialogs ---
+        if page.locator('.mat-mdc-dialog-container').is_visible():
+            self._close_drawer(page)
+
+        # --- SEARCH ---
+        search_box = page.locator("input[placeholder='Search']").first
+        if not search_box.is_visible():
+            self.log("Search box not found! Are you on the Participants page?", "ERROR")
+            return
+
+        search_box.click()
+        search_box.fill("")
+        search_box.press_sequentially(search_val, delay=50)
+        page.wait_for_timeout(2000)
+
+        # --- FIND ALL EXACT MATCHES ---
+        grid_rows = page.locator('.ag-row')
+        total_visible = grid_rows.count()
+
+        if total_visible == 0:
+            self.log(f"[SKIP] No rows found for: {search_val}", "WARNING")
+            return
+
+        # Count exact name matches (first cell = Name column)
+        exact_match_count = 0
+        for j in range(total_visible):
+            try:
+                name_cell = grid_rows.nth(j).locator('.ag-cell').first
+                if name_cell.inner_text().strip().lower() == search_val.lower():
+                    exact_match_count += 1
+            except:
+                pass
+
+        if exact_match_count == 0:
+            self.log(f"[SKIP] No exact match for '{search_val}' ({total_visible} partial results)", "WARNING")
+            return
+
+        self.log(f"Found {exact_match_count} exact match(es) for '{search_val}'", "INFO")
+
+        # --- PROCESS EACH MATCH ---
+        processed = 0
+        for match_num in range(exact_match_count):
+            # Check for stop
+            if self.stop_event and self.stop_event.is_set():
+                break
+            # Check for pause
+            if self.pause_event and not self.pause_event.is_set():
+                self.log("⏸️ Paused... Waiting to resume.", "WARNING")
+                self.pause_event.wait()
+
+            self.log(f"  >> Processing match {match_num + 1}/{exact_match_count}...", "INFO")
+
+            # Re-search if not the first match (DOM may have refreshed after save)
+            if match_num > 0:
+                page.wait_for_timeout(1000)
+                search_box = page.locator("input[placeholder='Search']").first
+                search_box.click()
+                search_box.fill("")
+                search_box.press_sequentially(search_val, delay=50)
+                page.wait_for_timeout(2000)
+
+            # Locate the nth exact match
+            grid_rows = page.locator('.ag-row')
+            target_row = None
+            current_match = 0
+            for j in range(grid_rows.count()):
+                try:
+                    name_cell = grid_rows.nth(j).locator('.ag-cell').first
+                    if name_cell.inner_text().strip().lower() == search_val.lower():
+                        if current_match == match_num:
+                            target_row = grid_rows.nth(j)
+                            break
+                        current_match += 1
+                except:
+                    pass
+
+            if not target_row:
+                self.log(f"  [WARN] Could not locate match {match_num + 1}. Skipping.", "WARNING")
+                continue
+
+            try:
+                # --- 1. CLICK ROW (Opens Competitor Dialog) ---
+                target_row.click()
+                page.wait_for_timeout(1500)
+
+                dialog = page.locator('.mat-mdc-dialog-container').last
+                if not dialog.is_visible():
+                    self.log("  [ERROR] Competitor dialog did not open.", "ERROR")
+                    continue
+
+                # --- 2. CLICK TRANSLATE ICON (Next to Name field) ---
+                translate_clicked = False
+
+                # Strategy A: data-test attribute for language icon (first = Name, not Short Name)
+                try:
+                    btn = dialog.locator('mat-icon[data-test="language-icon"]').first
+                    if btn.is_visible():
+                        btn.click()
+                        translate_clicked = True
+                except:
+                    pass
+
+                # Strategy B: mat-icon with text 'translate' or 'g_translate'
+                if not translate_clicked:
+                    try:
+                        btn = dialog.locator('mat-icon').filter(has_text='translate').first
+                        if btn.is_visible():
+                            btn.click()
+                            translate_clicked = True
+                    except:
+                        pass
+
+                # Strategy C: Generic icon button in the first form field area
+                if not translate_clicked:
+                    try:
+                        btn = dialog.locator('mat-icon').filter(has_text='g_translate').first
+                        if btn.is_visible():
+                            btn.click()
+                            translate_clicked = True
+                    except:
+                        pass
+
+                # Strategy D: Any clickable icon near the Name input
+                if not translate_clicked:
+                    try:
+                        name_field = dialog.locator('mat-form-field').first
+                        btn = name_field.locator('mat-icon').first
+                        if btn.is_visible():
+                            btn.click()
+                            translate_clicked = True
+                    except:
+                        pass
+
+                if not translate_clicked:
+                    self.log("  [ERROR] Could not find translate icon in Competitor dialog.", "ERROR")
+                    page.keyboard.press("Escape")
+                    page.wait_for_timeout(500)
+                    continue
+
+                page.wait_for_timeout(1500)
+
+                # --- 3. FILL TRANSLATIONS (Update Label dialog is now open) ---
+                for config_key, csv_col in found_langs:
+                    config = lang_config[config_key]
+                    target_val = row.get(csv_col, '').strip()
+                    if not target_val:
+                        continue
+
+                    if mode == 'verify':
+                        self._verify_entry(page, config['drawer_label'], target_val, csv_col)
+                    else:
+                        self._update_entry(page, config, target_val, csv_col, skip_save=True)
+
+                # --- 4. SAVE ---
+                if mode != 'verify':
+                    # 4a. Save Label Editor (topmost dialog)
+                    self.log("  [Step] Saving Translation Changes...", "INFO")
+                    
+                    # Wait for UI to settle after all the filling
+                    page.wait_for_timeout(1000)
+
+                    # FIND THE CORRECT DIALOG: Look for the one that says "Update Label"
+                    label_dialog = page.locator('.mat-mdc-dialog-container').filter(has_text=re.compile(r'Update Label', re.I)).last
+                    
+                    if not label_dialog.is_visible():
+                        # Fallback to just the last dialog
+                        label_dialog = page.locator('.mat-mdc-dialog-container').last
+                    
+                    # FORCE DIRTY STATE: Use the LAST visible input to trigger validation
+                    try:
+                        last_input = label_dialog.locator('input, textarea').last
+                        if last_input.is_visible():
+                            last_input.click()
+                            page.keyboard.type(" ") 
+                            page.keyboard.press("Backspace") 
+                            page.keyboard.press("Tab")
+                            page.wait_for_timeout(500)
+                    except:
+                        pass
+
+                    # Target the Save button STRICTLY inside this dialog
+                    label_save = label_dialog.locator('button:has-text("Save")').first
+
+                    if label_save.is_visible():
+                        if not label_save.is_enabled():
+                             self.log("  [WARN] Save button is disabled. Trying to click dialog background to force blur...", "WARNING")
+                             label_dialog.locator('.mat-mdc-dialog-surface').click(position={'x': 10, 'y': 10})
+                             page.wait_for_timeout(500)
+
+                        if label_save.is_enabled():
+                            self.log("  [Step] Clicking Label Save...", "INFO")
+                            label_save.click(force=True)
+                            try:
+                                # Wait for this specific dialog to disappear
+                                label_dialog.wait_for(state='hidden', timeout=7000)
+                            except:
+                                self.log("  [WARN] Label dialog persistent. Trying Escape.", "WARNING")
+                                page.keyboard.press("Escape")
+                        else:
+                            self.log("  [WARN] Save button persistent disabled. Closing.", "WARNING")
+                            page.keyboard.press("Escape")
+                    else:
+                        self.log("  [ERROR] Label Save button not found within the dialog. Trying broad search...", "ERROR")
+                        broad_save = page.locator('button:has-text("Save")').last
+                        if broad_save.is_visible() and broad_save.is_enabled():
+                            broad_save.click(force=True)
+                        else:
+                            page.keyboard.press("Escape")
+
+                    page.wait_for_timeout(1500) # Crucial: Let the first save fully process in the backend
+
+                    # 4b. Save Competitor dialog (the parent dialog)
+                    comp_dialog = page.locator('.mat-mdc-dialog-container').last
+                    
+                    if comp_dialog.is_visible():
+                        self.log("  [Step] Finalizing Competitor Record...", "INFO")
+                        
+                        # TRICK: Click the Name field in the parent dialog to "wake up" the competitor save button
+                        try:
+                            parent_input = comp_dialog.locator('input, textarea').first
+                            if parent_input.is_visible():
+                                parent_input.click()
+                                page.wait_for_timeout(200)
+                                page.keyboard.press("Tab")
+                        except:
+                            pass
+
+                        comp_save = comp_dialog.locator('button:has-text("Save")').first
+                        
+                        if comp_save.is_visible():
+                            if comp_save.is_enabled():
+                                comp_save.click(force=True)
+                                try:
+                                    comp_dialog.wait_for(state='hidden', timeout=6000)
+                                    self.log(f"  [SUCCESS] Match {match_num + 1} fully committed.", "SUCCESS")
+                                except:
+                                    self.log("  [WARN] Competitor dialog persistent. Closing manually.", "WARNING")
+                                    page.keyboard.press("Escape")
+                            else:
+                                self.log("  [INFO] Competitor Save button is DISABLED. The app might have auto-saved or requires no further action. Closing.", "INFO")
+                                page.keyboard.press("Escape")
+                        else:
+                            self.log("  [INFO] Competitor Save button not found. Closing dialog.", "INFO")
+                            page.keyboard.press("Escape")
+
+                    page.wait_for_timeout(1000)
+
+                processed += 1
+
+            except Exception as e:
+                self.log(f"  [ERROR] Match {match_num + 1} failed: {e}", "ERROR")
+                page.keyboard.press("Escape")
+                page.wait_for_timeout(500)
+                page.keyboard.press("Escape")
+                page.wait_for_timeout(500)
+
+        self.log(f"Completed '{search_val}': {processed}/{exact_match_count} matches processed", "INFO")
